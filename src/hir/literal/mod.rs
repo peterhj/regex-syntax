@@ -1,4 +1,4 @@
-// Copyright 2014-2015 The Rust Project Developers. See the COPYRIGHT
+// Copyright 2018 The Rust Project Developers. See the COPYRIGHT
 // file at the top-level directory of this distribution and at
 // http://rust-lang.org/COPYRIGHT.
 //
@@ -8,31 +8,43 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+/*!
+Provides routines for extracting literal prefixes and suffixes from an `Hir`.
+*/
+
 use std::cmp;
 use std::fmt;
 use std::iter;
 use std::mem;
 use std::ops;
 
-use {Expr, CharClass, ClassRange, ByteClass, ByteRange, Repeater};
+use hir::{self, Hir, HirKind};
+use unicode;
 
 /// A set of literal byte strings extracted from a regular expression.
 ///
-/// Every member of the set is a `Lit`, which is represented by a `Vec<u8>`.
-/// (Notably, it may contain invalid UTF-8.) Every member is said to be either
-/// *complete* or *cut*. A complete literal means that it extends until the
-/// beginning (or end) of the regular expression. In some circumstances, this
-/// can be used to indicate a match in the regular expression.
+/// Every member of the set is a `Literal`, which is represented by a
+/// `Vec<u8>`. (Notably, it may contain invalid UTF-8.) Every member is
+/// said to be either *complete* or *cut*. A complete literal means that
+/// it extends until the beginning (or end) of the regular expression. In
+/// some circumstances, this can be used to indicate a match in the regular
+/// expression.
 ///
-/// Note that a key aspect of literal extraction is knowing when to stop. It is
-/// not feasible to blindly extract all literals from a regular expression,
-/// even if there are finitely many. For example, the regular expression
-/// `[0-9]{10}` has `10^10` distinct literals. For this reason, literal
-/// extraction is bounded to some low number by default using heuristics, but
-/// the limits can be tweaked.
+/// A key aspect of literal extraction is knowing when to stop. It is not
+/// feasible to blindly extract all literals from a regular expression, even if
+/// there are finitely many. For example, the regular expression `[0-9]{10}`
+/// has `10^10` distinct literals. For this reason, literal extraction is
+/// bounded to some low number by default using heuristics, but the limits can
+/// be tweaked.
+///
+/// **WARNING**: Literal extraction uses stack space proportional to the size
+/// of the `Hir` expression. At some point, this drawback will be eliminated.
+/// To protect yourself, set a reasonable
+/// [`nest_limit` on your `Parser`](../../struct.ParserBuilder.html#method.nest_limit).
+/// This is done for you by default.
 #[derive(Clone, Eq, PartialEq)]
 pub struct Literals {
-    lits: Vec<Lit>,
+    lits: Vec<Literal>,
     limit_size: usize,
     limit_class: usize,
 }
@@ -42,7 +54,7 @@ pub struct Literals {
 /// This type has `Deref` and `DerefMut` impls to `Vec<u8>` so that all slice
 /// and `Vec` operations are available.
 #[derive(Clone, Eq, Ord)]
-pub struct Lit {
+pub struct Literal {
     v: Vec<u8>,
     cut: bool,
 }
@@ -55,6 +67,20 @@ impl Literals {
             limit_size: 250,
             limit_class: 10,
         }
+    }
+
+    /// Returns a set of literal prefixes extracted from the given `Hir`.
+    pub fn prefixes(expr: &Hir) -> Literals {
+        let mut lits = Literals::empty();
+        lits.union_prefixes(expr);
+        lits
+    }
+
+    /// Returns a set of literal suffixes extracted from the given `Hir`.
+    pub fn suffixes(expr: &Hir) -> Literals {
+        let mut lits = Literals::empty();
+        lits.union_suffixes(expr);
+        lits
     }
 
     /// Get the approximate size limit (in bytes) of this set.
@@ -95,7 +121,7 @@ impl Literals {
     }
 
     /// Returns the set of literals as a slice. Its order is unspecified.
-    pub fn literals(&self) -> &[Lit] {
+    pub fn literals(&self) -> &[Literal] {
         &self.lits
     }
 
@@ -216,7 +242,7 @@ impl Literals {
         if self.lits.is_empty() {
             return self.to_empty();
         }
-        let mut old: Vec<Lit> = self.lits.iter().cloned().collect();
+        let mut old: Vec<Literal> = self.lits.iter().cloned().collect();
         let mut new = self.to_empty();
     'OUTER:
         while let Some(mut candidate) = old.pop() {
@@ -298,7 +324,7 @@ impl Literals {
     /// Note that prefix literals extracted from `expr` are said to be complete
     /// if and only if the literal extends from the beginning of `expr` to the
     /// end of `expr`.
-    pub fn union_prefixes(&mut self, expr: &Expr) -> bool {
+    pub fn union_prefixes(&mut self, expr: &Hir) -> bool {
         let mut lits = self.to_empty();
         prefixes(expr, &mut lits);
         !lits.is_empty() && !lits.contains_empty() && self.union(lits)
@@ -313,7 +339,7 @@ impl Literals {
     /// Note that prefix literals extracted from `expr` are said to be complete
     /// if and only if the literal extends from the end of `expr` to the
     /// beginning of `expr`.
-    pub fn union_suffixes(&mut self, expr: &Expr) -> bool {
+    pub fn union_suffixes(&mut self, expr: &Hir) -> bool {
         let mut lits = self.to_empty();
         suffixes(expr, &mut lits);
         lits.reverse();
@@ -330,7 +356,7 @@ impl Literals {
             return false;
         }
         if lits.is_empty() {
-            self.lits.push(Lit::empty());
+            self.lits.push(Literal::empty());
         } else {
             self.lits.extend(lits.lits);
         }
@@ -373,7 +399,7 @@ impl Literals {
 
         let mut base = self.remove_complete();
         if base.is_empty() {
-            base = vec![Lit::empty()];
+            base = vec![Literal::empty()];
         }
         for lits_lit in lits.literals() {
             for mut self_lit in base.clone() {
@@ -402,7 +428,7 @@ impl Literals {
         }
         if self.lits.is_empty() {
             let i = cmp::min(self.limit_size, bytes.len());
-            self.lits.push(Lit::new(bytes[..i].to_owned()));
+            self.lits.push(Literal::new(bytes[..i].to_owned()));
             self.lits[0].cut = i < bytes.len();
             return !self.lits[0].is_cut();
         }
@@ -430,7 +456,7 @@ impl Literals {
     ///
     /// Returns false if adding this literal would cause the class to be too
     /// big.
-    pub fn add(&mut self, lit: Lit) -> bool {
+    pub fn add(&mut self, lit: Literal) -> bool {
         if self.num_bytes() + lit.len() > self.limit_size {
             return false;
         }
@@ -441,7 +467,7 @@ impl Literals {
     /// Extends each literal in this set with the character class given.
     ///
     /// Returns false if the character class was too big to add.
-    pub fn add_char_class(&mut self, cls: &CharClass) -> bool {
+    pub fn add_char_class(&mut self, cls: &hir::ClassUnicode) -> bool {
         self._add_char_class(cls, false)
     }
 
@@ -449,21 +475,25 @@ impl Literals {
     /// writing the bytes of each character in reverse.
     ///
     /// Returns false if the character class was too big to add.
-    fn add_char_class_reverse(&mut self, cls: &CharClass) -> bool {
+    fn add_char_class_reverse(&mut self, cls: &hir::ClassUnicode) -> bool {
         self._add_char_class(cls, true)
     }
 
-    fn _add_char_class(&mut self, cls: &CharClass, reverse: bool) -> bool {
+    fn _add_char_class(
+        &mut self,
+        cls: &hir::ClassUnicode,
+        reverse: bool,
+    ) -> bool {
         use std::char;
 
-        if self.class_exceeds_limits(cls.num_chars()) {
+        if self.class_exceeds_limits(cls_char_count(cls)) {
             return false;
         }
         let mut base = self.remove_complete();
         if base.is_empty() {
-            base = vec![Lit::empty()];
+            base = vec![Literal::empty()];
         }
-        for r in cls {
+        for r in cls.iter() {
             let (s, e) = (r.start as u32, r.end as u32 + 1);
             for c in (s..e).filter_map(char::from_u32) {
                 for mut lit in base.clone() {
@@ -482,15 +512,15 @@ impl Literals {
     /// Extends each literal in this set with the byte class given.
     ///
     /// Returns false if the byte class was too big to add.
-    pub fn add_byte_class(&mut self, cls: &ByteClass) -> bool {
-        if self.class_exceeds_limits(cls.num_bytes()) {
+    pub fn add_byte_class(&mut self, cls: &hir::ClassBytes) -> bool {
+        if self.class_exceeds_limits(cls_byte_count(cls)) {
             return false;
         }
         let mut base = self.remove_complete();
         if base.is_empty() {
-            base = vec![Lit::empty()];
+            base = vec![Literal::empty()];
         }
-        for r in cls {
+        for r in cls.iter() {
             let (s, e) = (r.start as u32, r.end as u32 + 1);
             for b in (s..e).map(|b| b as u8) {
                 for mut lit in base.clone() {
@@ -523,7 +553,7 @@ impl Literals {
     }
 
     /// Pops all complete literals out of this set.
-    fn remove_complete(&mut self) -> Vec<Lit> {
+    fn remove_complete(&mut self) -> Vec<Literal> {
         let mut base = vec![];
         for lit in mem::replace(&mut self.lits, vec![]) {
             if lit.is_cut() {
@@ -570,73 +600,67 @@ impl Literals {
     }
 }
 
-fn prefixes(expr: &Expr, lits: &mut Literals) {
-    use Expr::*;
-    match *expr {
-        Literal { ref chars, casei: false } => {
-            let s: String = chars.iter().cloned().collect();
-            lits.cross_add(s.as_bytes());
+fn prefixes(expr: &Hir, lits: &mut Literals) {
+    match *expr.kind() {
+        HirKind::Literal(hir::Literal::Unicode(c)) => {
+            let mut buf = [0u8; 4];
+            let i = unicode::encode_utf8(c, &mut buf).unwrap();
+            lits.cross_add(&buf[..i]);
         }
-        Literal { ref chars, casei: true } => {
-            for &c in chars {
-                let cls = CharClass::new(vec![
-                    ClassRange { start: c, end: c },
-                ]).case_fold();
-                if !lits.add_char_class(&cls) {
-                    lits.cut();
-                    return;
-                }
-            }
+        HirKind::Literal(hir::Literal::Byte(b)) => {
+            lits.cross_add(&[b]);
         }
-        LiteralBytes { ref bytes, casei: false } => {
-            lits.cross_add(bytes);
-        }
-        LiteralBytes { ref bytes, casei: true } => {
-            for &b in bytes {
-                let cls = ByteClass::new(vec![
-                    ByteRange { start: b, end: b },
-                ]).case_fold();
-                if !lits.add_byte_class(&cls) {
-                    lits.cut();
-                    return;
-                }
-            }
-        }
-        Class(ref cls) => {
+        HirKind::Class(hir::Class::Unicode(ref cls)) => {
             if !lits.add_char_class(cls) {
                 lits.cut();
             }
         }
-        ClassBytes(ref cls) => {
+        HirKind::Class(hir::Class::Bytes(ref cls)) => {
             if !lits.add_byte_class(cls) {
                 lits.cut();
             }
         }
-        Group { ref e, .. } => {
-            prefixes(&**e, lits);
+        HirKind::Group(hir::Group { ref hir, .. }) => {
+            prefixes(&**hir, lits);
         }
-        Repeat { ref e, r: Repeater::ZeroOrOne, .. } => {
-            repeat_zero_or_one_literals(&**e, lits, prefixes);
+        HirKind::Repetition(ref x) => {
+            match x.kind {
+                hir::RepetitionKind::ZeroOrOne => {
+                    repeat_zero_or_one_literals(&x.hir, lits, prefixes);
+                }
+                hir::RepetitionKind::ZeroOrMore => {
+                    repeat_zero_or_more_literals(&x.hir, lits, prefixes);
+                }
+                hir::RepetitionKind::OneOrMore => {
+                    repeat_one_or_more_literals(&x.hir, lits, prefixes);
+                }
+                hir::RepetitionKind::Range(ref rng) => {
+                    let (min, max) = match *rng {
+                        hir::RepetitionRange::Exactly(m) => {
+                            (m, Some(m))
+                        }
+                        hir::RepetitionRange::AtLeast(m) => {
+                            (m, None)
+                        }
+                        hir::RepetitionRange::Bounded(m, n) => {
+                            (m, Some(n))
+                        }
+                    };
+                    repeat_range_literals(
+                        &x.hir, min, max, x.greedy, lits, prefixes)
+                }
+            }
         }
-        Repeat { ref e, r: Repeater::ZeroOrMore, .. } => {
-            repeat_zero_or_more_literals(&**e, lits, prefixes);
-        }
-        Repeat { ref e, r: Repeater::OneOrMore, .. } => {
-            repeat_one_or_more_literals(&**e, lits, prefixes);
-        }
-        Repeat { ref e, r: Repeater::Range { min, max }, greedy } => {
-            repeat_range_literals(&**e, min, max, greedy, lits, prefixes);
-        }
-        Concat(ref es) if es.is_empty() => {}
-        Concat(ref es) if es.len() == 1 => prefixes(&es[0], lits),
-        Concat(ref es) => {
+        HirKind::Concat(ref es) if es.is_empty() => {}
+        HirKind::Concat(ref es) if es.len() == 1 => prefixes(&es[0], lits),
+        HirKind::Concat(ref es) => {
             for e in es {
-                if let StartText = *e {
+                if let HirKind::Anchor(hir::Anchor::StartText) = *e.kind() {
                     if !lits.is_empty() {
                         lits.cut();
                         break;
                     }
-                    lits.add(Lit::empty());
+                    lits.add(Literal::empty());
                     continue;
                 }
                 let mut lits2 = lits.to_empty();
@@ -650,83 +674,76 @@ fn prefixes(expr: &Expr, lits: &mut Literals) {
                 }
             }
         }
-        Alternate(ref es) => {
+        HirKind::Alternation(ref es) => {
             alternate_literals(es, lits, prefixes);
         }
         _ => lits.cut(),
     }
 }
 
-fn suffixes(expr: &Expr, lits: &mut Literals) {
-    use Expr::*;
-    match *expr {
-        Literal { ref chars, casei: false } => {
-            let s: String = chars.iter().cloned().collect();
-            let mut bytes = s.into_bytes();
-            bytes.reverse();
-            lits.cross_add(&bytes);
+fn suffixes(expr: &Hir, lits: &mut Literals) {
+    match *expr.kind() {
+        HirKind::Literal(hir::Literal::Unicode(c)) => {
+            let mut buf = [0u8; 4];
+            let i = unicode::encode_utf8(c, &mut buf).unwrap();
+            let mut buf = &mut buf[..i];
+            buf.reverse();
+            lits.cross_add(buf);
         }
-        Literal { ref chars, casei: true } => {
-            for &c in chars.iter().rev() {
-                let cls = CharClass::new(vec![
-                    ClassRange { start: c, end: c },
-                ]).case_fold();
-                if !lits.add_char_class_reverse(&cls) {
-                    lits.cut();
-                    return;
-                }
-            }
+        HirKind::Literal(hir::Literal::Byte(b)) => {
+            lits.cross_add(&[b]);
         }
-        LiteralBytes { ref bytes, casei: false } => {
-            let b: Vec<u8> = bytes.iter().rev().cloned().collect();
-            lits.cross_add(&b);
-        }
-        LiteralBytes { ref bytes, casei: true } => {
-            for &b in bytes.iter().rev() {
-                let cls = ByteClass::new(vec![
-                    ByteRange { start: b, end: b },
-                ]).case_fold();
-                if !lits.add_byte_class(&cls) {
-                    lits.cut();
-                    return;
-                }
-            }
-        }
-        Class(ref cls) => {
+        HirKind::Class(hir::Class::Unicode(ref cls)) => {
             if !lits.add_char_class_reverse(cls) {
                 lits.cut();
             }
         }
-        ClassBytes(ref cls) => {
+        HirKind::Class(hir::Class::Bytes(ref cls)) => {
             if !lits.add_byte_class(cls) {
                 lits.cut();
             }
         }
-        Group { ref e, .. } => {
-            suffixes(&**e, lits);
+        HirKind::Group(hir::Group { ref hir, .. }) => {
+            suffixes(&**hir, lits);
         }
-        Repeat { ref e, r: Repeater::ZeroOrOne, .. } => {
-            repeat_zero_or_one_literals(&**e, lits, suffixes);
+        HirKind::Repetition(ref x) => {
+            match x.kind {
+                hir::RepetitionKind::ZeroOrOne => {
+                    repeat_zero_or_one_literals(&x.hir, lits, suffixes);
+                }
+                hir::RepetitionKind::ZeroOrMore => {
+                    repeat_zero_or_more_literals(&x.hir, lits, suffixes);
+                }
+                hir::RepetitionKind::OneOrMore => {
+                    repeat_one_or_more_literals(&x.hir, lits, suffixes);
+                }
+                hir::RepetitionKind::Range(ref rng) => {
+                    let (min, max) = match *rng {
+                        hir::RepetitionRange::Exactly(m) => {
+                            (m, Some(m))
+                        }
+                        hir::RepetitionRange::AtLeast(m) => {
+                            (m, None)
+                        }
+                        hir::RepetitionRange::Bounded(m, n) => {
+                            (m, Some(n))
+                        }
+                    };
+                    repeat_range_literals(
+                        &x.hir, min, max, x.greedy, lits, suffixes)
+                }
+            }
         }
-        Repeat { ref e, r: Repeater::ZeroOrMore, .. } => {
-            repeat_zero_or_more_literals(&**e, lits, suffixes);
-        }
-        Repeat { ref e, r: Repeater::OneOrMore, .. } => {
-            repeat_one_or_more_literals(&**e, lits, suffixes);
-        }
-        Repeat { ref e, r: Repeater::Range { min, max }, greedy } => {
-            repeat_range_literals(&**e, min, max, greedy, lits, suffixes);
-        }
-        Concat(ref es) if es.is_empty() => {}
-        Concat(ref es) if es.len() == 1 => suffixes(&es[0], lits),
-        Concat(ref es) => {
+        HirKind::Concat(ref es) if es.is_empty() => {}
+        HirKind::Concat(ref es) if es.len() == 1 => suffixes(&es[0], lits),
+        HirKind::Concat(ref es) => {
             for e in es.iter().rev() {
-                if let EndText = *e {
+                if let HirKind::Anchor(hir::Anchor::EndText) = *e.kind() {
                     if !lits.is_empty() {
                         lits.cut();
                         break;
                     }
-                    lits.add(Lit::empty());
+                    lits.add(Literal::empty());
                     continue;
                 }
                 let mut lits2 = lits.to_empty();
@@ -740,15 +757,15 @@ fn suffixes(expr: &Expr, lits: &mut Literals) {
                 }
             }
         }
-        Alternate(ref es) => {
+        HirKind::Alternation(ref es) => {
             alternate_literals(es, lits, suffixes);
         }
         _ => lits.cut(),
     }
 }
 
-fn repeat_zero_or_one_literals<F: FnMut(&Expr, &mut Literals)>(
-    e: &Expr,
+fn repeat_zero_or_one_literals<F: FnMut(&Hir, &mut Literals)>(
+    e: &Hir,
     lits: &mut Literals,
     mut f: F,
 ) {
@@ -760,14 +777,14 @@ fn repeat_zero_or_one_literals<F: FnMut(&Expr, &mut Literals)>(
         lits.cut();
         return;
     }
-    lits2.add(Lit::empty());
+    lits2.add(Literal::empty());
     if !lits.union(lits2) {
         lits.cut();
     }
 }
 
-fn repeat_zero_or_more_literals<F: FnMut(&Expr, &mut Literals)>(
-    e: &Expr,
+fn repeat_zero_or_more_literals<F: FnMut(&Hir, &mut Literals)>(
+    e: &Hir,
     lits: &mut Literals,
     mut f: F,
 ) {
@@ -780,14 +797,14 @@ fn repeat_zero_or_more_literals<F: FnMut(&Expr, &mut Literals)>(
         return;
     }
     lits2.cut();
-    lits2.add(Lit::empty());
+    lits2.add(Literal::empty());
     if !lits.union(lits2) {
         lits.cut();
     }
 }
 
-fn repeat_one_or_more_literals<F: FnMut(&Expr, &mut Literals)>(
-    e: &Expr,
+fn repeat_one_or_more_literals<F: FnMut(&Hir, &mut Literals)>(
+    e: &Hir,
     lits: &mut Literals,
     mut f: F,
 ) {
@@ -795,30 +812,28 @@ fn repeat_one_or_more_literals<F: FnMut(&Expr, &mut Literals)>(
     lits.cut();
 }
 
-fn repeat_range_literals<F: FnMut(&Expr, &mut Literals)>(
-    e: &Expr,
+fn repeat_range_literals<F: FnMut(&Hir, &mut Literals)>(
+    e: &Hir,
     min: u32,
     max: Option<u32>,
     greedy: bool,
     lits: &mut Literals,
     mut f: F,
 ) {
-    use Expr::*;
-
     if min == 0 {
         // This is a bit conservative. If `max` is set, then we could
         // treat this as a finite set of alternations. For now, we
         // just treat it as `e*`.
-        f(&Repeat {
-            e: Box::new(e.clone()),
-            r: Repeater::ZeroOrMore,
+        f(&Hir::repetition(hir::Repetition {
+            kind: hir::RepetitionKind::ZeroOrMore,
             greedy: greedy,
-        }, lits);
+            hir: Box::new(e.clone()),
+        }), lits);
     } else {
         if min > 0 {
             let n = cmp::min(lits.limit_size, min as usize);
             let es = iter::repeat(e.clone()).take(n).collect();
-            f(&Concat(es), lits);
+            f(&Hir::concat(es), lits);
             if n < min as usize || lits.contains_empty() {
                 lits.cut();
             }
@@ -829,8 +844,8 @@ fn repeat_range_literals<F: FnMut(&Expr, &mut Literals)>(
     }
 }
 
-fn alternate_literals<F: FnMut(&Expr, &mut Literals)>(
-    es: &[Expr],
+fn alternate_literals<F: FnMut(&Hir, &mut Literals)>(
+    es: &[Hir],
     lits: &mut Literals,
     mut f: F,
 ) {
@@ -863,15 +878,15 @@ impl fmt::Debug for Literals {
     }
 }
 
-impl Lit {
+impl Literal {
     /// Returns a new complete literal with the bytes given.
-    pub fn new(bytes: Vec<u8>) -> Lit {
-        Lit { v: bytes, cut: false }
+    pub fn new(bytes: Vec<u8>) -> Literal {
+        Literal { v: bytes, cut: false }
     }
 
     /// Returns a new complete empty literal.
-    pub fn empty() -> Lit {
-        Lit { v: vec![], cut: false }
+    pub fn empty() -> Literal {
+        Literal { v: vec![], cut: false }
     }
 
     /// Returns true if this literal was "cut."
@@ -885,19 +900,19 @@ impl Lit {
     }
 }
 
-impl PartialEq for Lit {
-    fn eq(&self, other: &Lit) -> bool {
+impl PartialEq for Literal {
+    fn eq(&self, other: &Literal) -> bool {
         self.v == other.v
     }
 }
 
-impl PartialOrd for Lit {
-    fn partial_cmp(&self, other: &Lit) -> Option<cmp::Ordering> {
+impl PartialOrd for Literal {
+    fn partial_cmp(&self, other: &Literal) -> Option<cmp::Ordering> {
         self.v.partial_cmp(&other.v)
     }
 }
 
-impl fmt::Debug for Lit {
+impl fmt::Debug for Literal {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.is_cut() {
             write!(f, "Cut({})", escape_unicode(&self.v))
@@ -907,16 +922,16 @@ impl fmt::Debug for Lit {
     }
 }
 
-impl AsRef<[u8]> for Lit {
+impl AsRef<[u8]> for Literal {
     fn as_ref(&self) -> &[u8] { &self.v }
 }
 
-impl ops::Deref for Lit {
+impl ops::Deref for Literal {
     type Target = Vec<u8>;
     fn deref(&self) -> &Vec<u8> { &self.v }
 }
 
-impl ops::DerefMut for Lit {
+impl ops::DerefMut for Literal {
     fn deref_mut(&mut self) -> &mut Vec<u8> { &mut self.v }
 }
 
@@ -972,28 +987,44 @@ fn escape_byte(byte: u8) -> String {
     String::from_utf8_lossy(&escaped).into_owned()
 }
 
+fn cls_char_count(cls: &hir::ClassUnicode) -> usize {
+    cls.iter()
+        .map(|&r| 1 + (r.end as u32) - (r.start as u32))
+        .sum::<u32>() as usize
+}
+
+fn cls_byte_count(cls: &hir::ClassBytes) -> usize {
+    cls.iter()
+        .map(|&r| 1 + (r.end as u32) - (r.start as u32))
+        .sum::<u32>() as usize
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt;
 
-    use {Expr, ExprBuilder};
-    use super::{Literals, Lit, escape_bytes};
+    use ParserBuilder;
+    use hir::Hir;
+    use super::{Literals, Literal, escape_bytes};
 
     // To make test failures easier to read.
     #[derive(Debug, Eq, PartialEq)]
-    struct Bytes(Vec<ULit>);
+    struct Bytes(Vec<ULiteral>);
     #[derive(Debug, Eq, PartialEq)]
-    struct Unicode(Vec<ULit>);
+    struct Unicode(Vec<ULiteral>);
 
-    fn escape_lits(blits: &[Lit]) -> Vec<ULit> {
+    fn escape_lits(blits: &[Literal]) -> Vec<ULiteral> {
         let mut ulits = vec![];
         for blit in blits {
-            ulits.push(ULit { v: escape_bytes(&blit), cut: blit.is_cut() });
+            ulits.push(ULiteral {
+                v: escape_bytes(&blit),
+                cut: blit.is_cut(),
+            });
         }
         ulits
     }
 
-    fn create_lits<I: IntoIterator<Item=Lit>>(it: I) -> Literals {
+    fn create_lits<I: IntoIterator<Item=Literal>>(it: I) -> Literals {
         Literals {
             lits: it.into_iter().collect(),
             limit_size: 0,
@@ -1003,16 +1034,16 @@ mod tests {
 
     // Needs to be pub for 1.3?
     #[derive(Clone, Eq, PartialEq)]
-    pub struct ULit {
+    pub struct ULiteral {
         v: String,
         cut: bool,
     }
 
-    impl ULit {
+    impl ULiteral {
         fn is_cut(&self) -> bool { self.cut }
     }
 
-    impl fmt::Debug for ULit {
+    impl fmt::Debug for ULiteral {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             if self.is_cut() {
                 write!(f, "Cut({})", self.v)
@@ -1022,34 +1053,38 @@ mod tests {
         }
     }
 
-    impl PartialEq<Lit> for ULit {
-        fn eq(&self, other: &Lit) -> bool {
+    impl PartialEq<Literal> for ULiteral {
+        fn eq(&self, other: &Literal) -> bool {
             self.v.as_bytes() == &*other.v && self.is_cut() == other.is_cut()
         }
     }
 
-    impl PartialEq<ULit> for Lit {
-        fn eq(&self, other: &ULit) -> bool {
+    impl PartialEq<ULiteral> for Literal {
+        fn eq(&self, other: &ULiteral) -> bool {
             &*self.v == other.v.as_bytes() && self.is_cut() == other.is_cut()
         }
     }
 
     #[allow(non_snake_case)]
-    fn C(s: &'static str) -> ULit { ULit { v: s.to_owned(), cut: true } }
+    fn C(s: &'static str) -> ULiteral {
+        ULiteral { v: s.to_owned(), cut: true }
+    }
     #[allow(non_snake_case)]
-    fn M(s: &'static str) -> ULit { ULit { v: s.to_owned(), cut: false } }
+    fn M(s: &'static str) -> ULiteral {
+        ULiteral { v: s.to_owned(), cut: false }
+    }
 
-    fn prefixes(lits: &mut Literals, expr: &Expr) {
+    fn prefixes(lits: &mut Literals, expr: &Hir) {
         lits.union_prefixes(expr);
     }
 
-    fn suffixes(lits: &mut Literals, expr: &Expr) {
+    fn suffixes(lits: &mut Literals, expr: &Hir) {
         lits.union_suffixes(expr);
     }
 
     macro_rules! assert_lit_eq {
         ($which:ident, $got_lits:expr, $($expected_lit:expr),*) => {{
-            let expected: Vec<ULit> = vec![$($expected_lit),*];
+            let expected: Vec<ULiteral> = vec![$($expected_lit),*];
             let lits = $got_lits;
             assert_eq!(
                 $which(expected.clone()),
@@ -1070,13 +1105,20 @@ mod tests {
         ($name:ident, $which:ident, $re:expr, $($lit:expr),*) => {
             #[test]
             fn $name() {
-                let expr = Expr::parse($re).unwrap();
-                let lits = expr.$which();
+                let expr = ParserBuilder::new()
+                    .build()
+                    .parse($re)
+                    .unwrap();
+                let lits = Literals::$which(&expr);
                 assert_lit_eq!(Unicode, lits, $($lit),*);
 
-                let expr = ExprBuilder::new().allow_bytes(true).unicode(false)
-                                       .parse($re).unwrap();
-                let lits = expr.$which();
+                let expr = ParserBuilder::new()
+                    .allow_invalid_utf8(true)
+                    .unicode(false)
+                    .build()
+                    .parse($re)
+                    .unwrap();
+                let lits = Literals::$which(&expr);
                 assert_lit_eq!(Bytes, lits, $($lit),*);
             }
         };
@@ -1201,14 +1243,21 @@ mod tests {
         ($name:ident, $which:ident, $re:expr, $($lit:expr),*) => {
             #[test]
             fn $name() {
-                let expr = Expr::parse($re).unwrap();
+                let expr = ParserBuilder::new()
+                    .build()
+                    .parse($re)
+                    .unwrap();
                 let mut lits = Literals::empty();
                 lits.set_limit_size(20).set_limit_class(10);
                 $which(&mut lits, &expr);
                 assert_lit_eq!(Unicode, lits, $($lit),*);
 
-                let expr = ExprBuilder::new().allow_bytes(true).unicode(false)
-                                       .parse($re).unwrap();
+                let expr = ParserBuilder::new()
+                    .allow_invalid_utf8(true)
+                    .unicode(false)
+                    .build()
+                    .parse($re)
+                    .unwrap();
                 let mut lits = Literals::empty();
                 lits.set_limit_size(20).set_limit_class(10);
                 $which(&mut lits, &expr);
@@ -1357,12 +1406,12 @@ mod tests {
         ($name:ident, $given:expr, $expected:expr) => {
             #[test]
             fn $name() {
-                let given: Vec<Lit> =
+                let given: Vec<Literal> =
                     $given
                     .into_iter()
                     .map(|ul| {
                         let cut = ul.is_cut();
-                        Lit { v: ul.v.into_bytes(), cut: cut }
+                        Literal { v: ul.v.into_bytes(), cut: cut }
                     })
                     .collect();
                 let lits = create_lits(given);
@@ -1410,12 +1459,12 @@ mod tests {
         ($name:ident, $trim:expr, $given:expr, $expected:expr) => {
             #[test]
             fn $name() {
-                let given: Vec<Lit> =
+                let given: Vec<Literal> =
                     $given
                     .into_iter()
                     .map(|ul| {
                         let cut = ul.is_cut();
-                        Lit { v: ul.v.into_bytes(), cut: cut }
+                        Literal { v: ul.v.into_bytes(), cut: cut }
                     })
                     .collect();
                 let lits = create_lits(given);
@@ -1438,10 +1487,10 @@ mod tests {
         ($name:ident, $given:expr, $expected:expr) => {
             #[test]
             fn $name() {
-                let given: Vec<Lit> =
+                let given: Vec<Literal> =
                     $given
                     .into_iter()
-                    .map(|s: &str| Lit {
+                    .map(|s: &str| Literal {
                         v: s.to_owned().into_bytes(),
                         cut: false,
                     })
@@ -1474,10 +1523,10 @@ mod tests {
         ($name:ident, $given:expr, $expected:expr) => {
             #[test]
             fn $name() {
-                let given: Vec<Lit> =
+                let given: Vec<Literal> =
                     $given
                     .into_iter()
-                    .map(|s: &str| Lit {
+                    .map(|s: &str| Literal {
                         v: s.to_owned().into_bytes(),
                         cut: false,
                     })
